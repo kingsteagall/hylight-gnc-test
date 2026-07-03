@@ -13,8 +13,8 @@
 //               waypoint switch by perpendicular plane with turn anticipation.
 //
 // The inner loops (altitude / pitch / forward-speed / yaw-rate) and the
-// allocation are IDENTICAL between runs — only the yaw-setpoint policy
-// differs. The allocation respects the technical test's Fy = 0 constraint by
+// allocation are IDENTICAL between runs — only the guidance layer (the
+// yaw-setpoint policy and the leg-switch rule that comes with it) differs. The allocation respects the technical test's Fy = 0 constraint by
 // construction: pod lateral components are commanded antisymmetric
 // (fy_bow = −fy_stern), so yaw comes from a pure couple with zero net side
 // force — heading is the only lateral authority, as in the real vehicle.
@@ -54,7 +54,9 @@ function makeGnc(mode, p) {
   // Yaw-rate cascade (v3.2 lesson: slow, firm rotation; no limit cycles).
   const R_DES_MAX = 0.15; // rad/s
   const K_HEAD = 1.2, K_RATE = 300;
-  // Crab / L1 (same constants as the standalone demo).
+  // Crab / L1. NOTE: K_CRAB is deliberately SLOWER than in the standalone
+  // planar demo (0.12 vs 0.35): with this plant's heavier, integral-carried
+  // heading loop, 0.35 limit-cycled against it with a ~100 s period.
   const L1_DIST = 30, CORR_MAX = 40 * DEG, CRAB_MAX = 45 * DEG, K_CRAB = 0.12;
   const R_TURN = V_CRUISE / R_DES_MAX; // ~20 m anticipation
 
@@ -192,7 +194,10 @@ function run(mode) {
 }
 
 function metrics(res) {
-  // settled portion per leg: after |e| first < 8 m (turn arc is shared physics)
+  // WHOLE-leg cross-track, no exclusions: the proposed mode pays for its own
+  // turn-anticipation transients. (A settled-portion filter turned out to be
+  // asymmetric — the baseline switches inside the acceptance radius and never
+  // had samples excluded, only the proposed run did.)
   const legs = new Map();
   for (const row of res.traj) {
     const leg = row[6];
@@ -202,13 +207,11 @@ function metrics(res) {
   const per = [];
   for (const [leg, es] of legs) {
     if (es.length < 20) continue;
-    let i0 = es.findIndex((v) => Math.abs(v) < 8);
-    if (i0 < 0) i0 = 0;
-    const seg = es.slice(i0);
-    const rms = Math.sqrt(seg.reduce((s, v) => s + v * v, 0) / seg.length);
-    const worst = Math.max(...seg.map(Math.abs));
+    const rms = Math.sqrt(es.reduce((s, v) => s + v * v, 0) / es.length);
+    const worst = Math.max(...es.map(Math.abs));
     per.push({ leg, rms, worst });
   }
+  if (per.length === 0) throw new Error('no legs accumulated enough samples');
   const rms = per.reduce((s, v) => s + v.rms, 0) / per.length;
   const worst = Math.max(...per.map((v) => v.worst));
   return { rms, worst, per };

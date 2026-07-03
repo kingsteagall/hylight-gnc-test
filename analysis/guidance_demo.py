@@ -143,7 +143,9 @@ def run(guidance):
                 course_meas = np.arctan2(vg[1], vg[0])
                 crab += 0.35 * wrap(course_cmd - course_meas) * DT
                 crab = np.clip(crab, -35 * D2R, 35 * D2R)
-            sp = wrap(course_cmd + crab)
+            # setpoint kept CONTINUOUS (unwrapped) for the yaw PID — the
+            # ±180° flip pathology of the flight log cannot happen here
+            sp = sp_prev + wrap(course_cmd + crab - sp_prev)
             yaw_err = wrap(sp - p.psi)        # shortest arc, always
             # switch anticipated by the physical turn radius (PX4-L1 style)
             r_turn = V_CRUISE / R_MAX
@@ -171,19 +173,17 @@ def run(guidance):
 
 
 def metrics(lg):
-    # per-leg cross-track on the settled portion: after the vehicle first
-    # comes within 8 m of the line (the corner turn radius, ~29 m at 6 deg/s,
-    # is physics shared by both guidances). Legs that never settle are
-    # measured whole — that IS the failure.
+    # WHOLE-leg cross-track, no exclusions: the proposed guidance pays for its
+    # own corner-anticipation transients (an earlier settled-portion filter
+    # turned out to trim samples only from the proposed run — the baseline
+    # switches inside the acceptance radius and never had anything excluded).
     stats = []
     for leg in np.unique(lg["leg"]):
         m = lg["leg"] == leg
         if m.sum() < 20:
             continue
         e = lg["e"][m]
-        settled = np.where(np.abs(e) < 8.0)[0]
-        e_meas = e[settled[0]:] if len(settled) else e
-        stats.append((np.sqrt(np.mean(e_meas ** 2)), np.abs(e_meas).max()))
+        stats.append((np.sqrt(np.mean(e ** 2)), np.abs(e).max()))
     rms = np.mean([s[0] for s in stats]) if stats else np.nan
     worst = np.max([s[1] for s in stats]) if stats else np.nan
     return rms, worst

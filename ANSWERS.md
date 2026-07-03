@@ -326,13 +326,19 @@ bounded authority, no perfect wind knowledge):
 I implemented both guidance laws and flew them against each other twice, on
 the same missions in the same wind (`analysis/`):
 
-**1. Minimal planar model** (`analysis/guidance_demo.py`, self-contained ~200
-lines): slow yaw (6°/s, as the log's turnaround shows), gusty crosswind at
-~40–60% of airspeed, same inner loops for both. Long-leg rectangle mission:
+All metrics below are **whole-leg cross-track with no transient exclusions**
+— the proposed guidance pays for its own corner-anticipation transients in
+the numbers. (An earlier settled-portion filter was found, during adversarial
+self-review, to trim samples only from the proposed run; it was removed.)
+
+**1. Minimal planar model** (`analysis/guidance_demo.py`, a single
+self-contained file): slow yaw (6°/s, as the log's turnaround shows), gusty
+crosswind at ~40–60% of airspeed, same inner loops for both. Long-leg
+rectangle mission:
 
 ```
 baseline (bearing-chasing)   cross-track rms= 29.8 m  worst= 57.4 m
-proposed (course + crab)     cross-track rms=  5.3 m  worst= 18.0 m   (-16% mission time)
+proposed (course + crab)     cross-track rms=  7.5 m  worst= 28.4 m   (-16% mission time)
 ```
 
 **2. Full airship simulator** (my own; twin thrust-vectoring pods fore/aft,
@@ -340,28 +346,37 @@ no aerodynamic surfaces — same actuator concept as this vehicle; hull
 weathervane aerodynamics, actuator lags and rate limits, sinusoidal gusts +
 Ornstein–Uhlenbeck turbulence, noisy sensors incl. 0.5 m GPS). The GNC stack
 under test uses the Exercise 1 allocation with the **Fy = 0 constraint
-enforced by construction** (pod lateral components commanded antisymmetric —
-yaw is a pure couple, heading is the only lateral authority). Only the yaw
-setpoint policy differs between runs (`analysis/sim-ex2-guidance.mjs.txt`,
+respected by construction**: the allocator has no net-side-force channel —
+pod lateral components are commanded antisymmetric, so yaw is a pure couple
+and heading is the only lateral authority. (Commanded net side force is
+identically zero; the *delivered* Fy deviates only transiently through
+per-pod saturation clamps and actuator lag — measured at 0.05 N RMS, 0.75 N
+peak ≈ 1% of one motor's thrust.) Only the guidance layer — the yaw-setpoint
+policy and the leg-switch rule that comes with it — differs between runs;
+inner loops and allocation are identical (`analysis/sim-ex2-guidance.mjs.txt`,
 figure `analysis/sim_validation.png`):
 
 ```
                        cross-track RMS      worst       mission
 baseline (4 wind seeds)   23.4 - 27.0 m   51.6 - 64.3 m   ~360 s
-proposed (4 wind seeds)    6.8 -  8.3 m   15.6 - 30.0 m   410 - 550 s
+proposed (4 wind seeds)    8.2 -  9.0 m   20.8 - 30.0 m   410 - 550 s
 ```
 
-A ~3× reduction in RMS cross-track and 2–3× in worst-case, consistent across
-wind realizations. Two honest costs, both expected: (1) mission time grows
-14–50% — holding the line against a crosswind at 40–60% of airspeed means
-flying at a large crab angle, which spends airspeed; the baseline is "faster"
-precisely because it surrenders to the drift; (2) the residual is bounded
-breathing (±10–15 m at gust peaks), not zero — with `Fy = 0`, gust rejection
-is rate-limited by how fast a 12 m hull can re-point. One tuning lesson worth
-reporting: the crab integrator must be **slow** relative to the heading loop
-(here 0.12 rad/s per rad of course error); at 0.35 the two loops
-limit-cycled with a ~100 s period — the same "rotate slowly and firmly"
-lesson the yaw cascade itself follows.
+A 2.6–3.2× reduction in RMS cross-track and 1.7–2.7× in worst-case, mission
+completed in all runs. Two honest costs, both expected: (1) mission time
+grows 14–52% — holding the line against a crosswind at 40–60% of airspeed
+means flying at a large crab angle, which spends airspeed; the baseline is
+"faster" precisely because it surrenders to the drift. (2) The residual is
+bounded breathing, not zero: ±10–17 m on the crosswind legs, and 23–30 m at
+gust peaks on the slow upwind return leg, where ground speed — and with it
+course observability — drops. With `Fy = 0`, gust rejection is rate-limited
+by how fast a 12 m hull can re-point; the slow-leg residual is where that
+limit bites. One tuning lesson worth reporting: the crab integrator must be
+**slow** relative to the heading loop — in the full simulator, whose heavy
+heading loop leans on integral action, 0.35 rad/s per rad of course error
+limit-cycled against it with a ~100 s period, and 0.12 is used instead (the
+planar model's faster heading loop tolerates 0.35). It is the same "rotate
+slowly and firmly" lesson the yaw cascade itself follows.
 
 ---
 
@@ -373,6 +388,9 @@ lesson the yaw cascade itself follows.
   `analysis/flight_overview.png` and `analysis/flight_zoom.png`.
 - **Guidance demonstration**: `analysis/guidance_demo.py` (standalone planar
   model, produces `guidance_demo.png`); `analysis/sim-ex2-guidance.mjs.txt`
-  (the same comparison on my full airship simulator — runs inside that repo),
-  results in `analysis/ex2-results.json`, plotted by
-  `analysis/plot_sim_validation.py` → `analysis/sim_validation.png`.
+  (the same comparison on my full airship simulator — runs inside that repo
+  as `EX2_SEED=<n> node tests/ex2-guidance.mjs`). All four wind-seed result
+  files ship as `analysis/ex2-results-{42,7,123,2026}.json` (the 4-seed table
+  reads from their `metrics` fields); `analysis/ex2-results.json` is the
+  seed-42 run plotted by `analysis/plot_sim_validation.py` →
+  `analysis/sim_validation.png`.
