@@ -1,0 +1,229 @@
+// Exercise 2 (HyLight GNC test) — validation on the real simulator physics.
+//
+// Compares two guidance laws flying the SAME mission in the SAME wind on the
+// v3.2 plant (hull weathervane, sinusoidal gusts + OU turbulence, actuator
+// lags/rate limits, noisy sensors):
+//
+//   baseline  — what the flight log behaves like: yaw setpoint = bearing to
+//               the next waypoint recomputed from the (drifting, noisy)
+//               position; waypoint switch on an acceptance radius only.
+//   proposed  — course-based guidance: cross-track error against the LEG,
+//               bounded L1 correction, crab angle from slow integral action
+//               on (course_cmd − course_measured), shortest-arc everywhere,
+//               waypoint switch by perpendicular plane with turn anticipation.
+//
+// The inner loops (altitude / pitch / forward-speed / yaw-rate) and the
+// allocation are IDENTICAL between runs — only the yaw-setpoint policy
+// differs. The allocation respects the technical test's Fy = 0 constraint by
+// construction: pod lateral components are commanded antisymmetric
+// (fy_bow = −fy_stern), so yaw comes from a pure couple with zero net side
+// force — heading is the only lateral authority, as in the real vehicle.
+//
+// Run:  node tests/ex2-guidance.mjs        (from the repo root; Node >= 22)
+// Emits a JSON dump for plotting to stdout-adjacent file (see RESULTS_PATH).
+
+import { writeFileSync } from 'node:fs';
+import { FlightSim } from '../physics/flight.ts';
+import { HYLIGHTER, clone } from '../physics/presets.ts';
+
+const DEG = Math.PI / 180;
+const RESULTS_PATH = process.env.EX2_OUT ?? 'tests/ex2-results.json';
+
+const wrap = (a) => {
+  a = (a + Math.PI) % (2 * Math.PI);
+  if (a <= 0) a += 2 * Math.PI;
+  return a - Math.PI;
+};
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+// Mission: long legs relative to the turn radius, crosswind on leg 1.
+const WPTS = [
+  [0, 0],
+  [350, 0],
+  [350, 130],
+  [0, 130],
+  [0, 0],
+];
+const Z_HOLD = 25;
+const V_CRUISE = 3.0;
+const ACCEPT_R = 8;
+const T_END = 900;
+
+function makeGnc(mode, p) {
+  const ell = p.L / 2;
+  // Yaw-rate cascade (v3.2 lesson: slow, firm rotation; no limit cycles).
+  const R_DES_MAX = 0.15; // rad/s
+  const K_HEAD = 1.2, K_RATE = 300;
+  // Crab / L1 (same constants as the standalone demo).
+  const L1_DIST = 30, CORR_MAX = 40 * DEG, CRAB_MAX = 45 * DEG, K_CRAB = 0.12;
+  const R_TURN = V_CRUISE / R_DES_MAX; // ~20 m anticipation
+
+  const st = {
+    wp: 1, crab: 0, courseF: [1, 0], done: false, sp: 0, psiI: 0,
+  };
+
+  const stepFn = (m, _valid, _sp, pp, dt) => {
+    // --- guidance: yaw setpoint policy (the ONLY difference between modes)
+    const [ax, ay] = WPTS[st.wp - 1];
+    const [bx, by] = WPTS[st.wp];
+    const legLen = Math.hypot(bx - ax, by - ay);
+    const ux = (bx - ax) / legLen, uy = (by - ay) / legLen;
+    const relx = m.x - ax, rely = m.y - ay;
+    const along = relx * ux + rely * uy;
+    const e = -relx * uy + rely * ux; // signed cross-track from noisy GPS
+    const distWp = Math.hypot(bx - m.x, by - m.y);
+
+    let psiSp;
+    let switchLeg;
+    if (mode === 'baseline') {
+      psiSp = Math.atan2(by - m.y, bx - m.x);
+      switchLeg = distWp < ACCEPT_R;
+    } else {
+      const legAz = Math.atan2(uy, ux);
+      const courseCmd = legAz + clamp(-Math.atan2(e, L1_DIST), -CORR_MAX, CORR_MAX);
+      // measured course over ground, low-pass filtered as a vector
+      const aF = dt / 1.5;
+      st.courseF[0] += aF * (m.vx - st.courseF[0]);
+      st.courseF[1] += aF * (m.vy - st.courseF[1]);
+      if (Math.hypot(st.courseF[0], st.courseF[1]) > 0.8) {
+        const courseMeas = Math.atan2(st.courseF[1], st.courseF[0]);
+        st.crab = clamp(st.crab + K_CRAB * wrap(courseCmd - courseMeas) * dt,
+                        -CRAB_MAX, CRAB_MAX);
+      }
+      psiSp = wrap(courseCmd + st.crab);
+      switchLeg = along >= legLen - R_TURN || distWp < ACCEPT_R;
+    }
+    if (switchLeg && st.wp < WPTS.length - 1) st.wp += 1;
+    else if (switchLeg) st.done = true;
+    st.sp = psiSp;
+
+    // --- inner loops (identical in both modes) --------------------------
+    // forward speed along the nose (world-frame velocity -> body axial)
+    const cps = Math.cos(m.psi), sps = Math.sin(m.psi);
+    const u = cps * m.vx + sps * m.vy;
+    const Ffwd = clamp(14 * (V_CRUISE - u), -0.8 * pp.Tmax, 1.2 * pp.Tmax);
+
+    // altitude: buoyancy trim + PD
+    const Fup = clamp(pp.heaviness * 9.81 + 9 * (Z_HOLD - m.z) - 14 * m.vz,
+                      0, 1.4 * pp.Tmax);
+
+    // pitch to zero: differential vertical
+    const Mpitch = 60 * (0 - m.theta) - 260 * m.q;
+    const dFu = clamp(Mpitch / ell, -0.5 * pp.Tmax, 0.5 * pp.Tmax);
+
+    // yaw: heading -> rate cascade (+ integral: holding a crab means holding
+    // a steady couple against the hull weathervane moment) -> moment ->
+    // antisymmetric lateral pair
+    const hErr = wrap(psiSp - m.psi);
+    st.psiI = clamp(st.psiI + hErr * dt, -2, 2);
+    const rDes = clamp(K_HEAD * hErr, -R_DES_MAX, R_DES_MAX);
+    const Myaw = K_RATE * (rDes - m.r) + 120 * st.psiI;
+    const fyPair = clamp(Myaw / (2 * ell), -0.5 * pp.Tmax, 0.5 * pp.Tmax);
+
+    // --- allocation (Exercise 1 in the sim's T/tilt/azi parametrization):
+    // per pod (bow, stern): fx = axial/2, fz = vertical/2 +- pitch couple,
+    // fy = +-fyPair (antisymmetric => net side force ZERO by construction).
+    // Closed form with a normal and a reverse configuration: the horizontal
+    // force direction is the azimuth when cos(tilt) > 0, and its opposite
+    // when the pod is laid past vertical (tilt > 90 deg, feasible up to the
+    // 210 deg stop) — that is how braking (fx < 0) is realized.
+    const alloc = (fx, fy, fz) => {
+      const h = Math.hypot(fx, fy);
+      const T = Math.hypot(h, fz);
+      if (T < 1e-6) return [0, Math.PI / 2, 0];
+      let azi = Math.atan2(fy, fx);
+      let tilt;
+      if (Math.abs(azi) <= Math.PI / 2) {
+        tilt = Math.atan2(fz, h);            // normal config
+      } else {
+        azi = wrap(azi - Math.PI);           // reverse config: lay the pod
+        tilt = Math.PI - Math.atan2(fz, h);  // past vertical, thrust flips
+      }
+      return [
+        clamp(T, 0, pp.Tmax),
+        clamp(tilt, pp.tiltMin * DEG, pp.tiltMax * DEG),
+        clamp(azi, -pp.aziMax * DEG, pp.aziMax * DEG),
+      ];
+    };
+    const [Tb, tb, azb] = alloc(Ffwd / 2, +fyPair, Fup / 2 + dFu / 2);
+    const [Ts, ts, azs] = alloc(Ffwd / 2, -fyPair, Fup / 2 - dFu / 2);
+    return { T_bow: Tb, tilt_bow: tb, azi_bow: azb,
+             T_stern: Ts, tilt_stern: ts, azi_stern: azs };
+  };
+
+  return { stepFn, st };
+}
+
+function run(mode) {
+  const p = clone(HYLIGHTER);
+  p.windMean = 1.2;
+  p.windDir = 90;   // blows toward +y: pure crosswind on the +x legs
+  p.gustAmp = 0.6;
+  p.gustPer = 20;
+  p.turb = 0.5;
+  // The real HyLighter gyro vectors thrust in ANY direction (beta servo has
+  // full range; the v4 sim models the pods as omnidirectional). The v3.2
+  // preset's +-35 deg azimuth cone would strangle the yaw couple at cruise;
+  // open it up to the physical actuator.
+  p.aziMax = 90;
+
+  const gnc = makeGnc(mode, p);
+  const seed = Number(process.env.EX2_SEED ?? 42);
+  const sim = new FlightSim(p, gnc.stepFn, { z0: Z_HOLD, seed });
+  sim.sp = { z: Z_HOLD, x: NaN, y: NaN, psi: NaN }; // unused: guidance is internal
+
+  const traj = [];
+  const PHYS_DT = 0.005;
+  const steps = Math.round(T_END / PHYS_DT);
+  for (let i = 0; i < steps && !gnc.st.done; i++) {
+    sim.physicsStep();
+    if (i % 100 === 0) { // 0.5 s sampling for the dump
+      const s = sim.world.s;
+      // true-state cross-track for scoring (GNC itself only saw noisy meas)
+      const [ax, ay] = WPTS[gnc.st.wp - 1];
+      const [bx, by] = WPTS[gnc.st.wp];
+      const len = Math.hypot(bx - ax, by - ay);
+      const ux = (bx - ax) / len, uy = (by - ay) / len;
+      const e = -(s.x - ax) * uy + (s.y - ay) * ux;
+      traj.push([s.t, s.x, s.y, s.z, s.psi, e, gnc.st.wp, gnc.st.sp]);
+    }
+  }
+  return { traj, done: gnc.st.done, tEnd: sim.world.s.t };
+}
+
+function metrics(res) {
+  // settled portion per leg: after |e| first < 8 m (turn arc is shared physics)
+  const legs = new Map();
+  for (const row of res.traj) {
+    const leg = row[6];
+    if (!legs.has(leg)) legs.set(leg, []);
+    legs.get(leg).push(row[5]);
+  }
+  const per = [];
+  for (const [leg, es] of legs) {
+    if (es.length < 20) continue;
+    let i0 = es.findIndex((v) => Math.abs(v) < 8);
+    if (i0 < 0) i0 = 0;
+    const seg = es.slice(i0);
+    const rms = Math.sqrt(seg.reduce((s, v) => s + v * v, 0) / seg.length);
+    const worst = Math.max(...seg.map(Math.abs));
+    per.push({ leg, rms, worst });
+  }
+  const rms = per.reduce((s, v) => s + v.rms, 0) / per.length;
+  const worst = Math.max(...per.map((v) => v.worst));
+  return { rms, worst, per };
+}
+
+const out = {};
+for (const mode of ['baseline', 'proposed']) {
+  const res = run(mode);
+  const m = metrics(res);
+  out[mode] = { ...res, metrics: m };
+  console.log(
+    `${mode.padEnd(9)} cross-track rms=${m.rms.toFixed(1).padStart(5)} m  ` +
+    `worst=${m.worst.toFixed(1).padStart(5)} m  done=${res.done} ` +
+    `t=${res.tEnd.toFixed(0)} s`);
+}
+out.waypoints = WPTS;
+writeFileSync(RESULTS_PATH, JSON.stringify(out));
+console.log(`wrote ${RESULTS_PATH}`);

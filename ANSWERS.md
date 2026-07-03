@@ -321,19 +321,58 @@ bounded authority, no perfect wind knowledge):
    actuator commands — both to close the loop and to make the next flight
    debuggable.
 
-Expected result — from having implemented this scheme in my own 6-DoF airship
-flight simulator (twin thrust-vectoring pods fore/aft, no aerodynamic
-surfaces, comparable to this vehicle): switching from bearing-chasing to
-course-based guidance with an integral crab term took cross-track drift in
-gusty crosswind from ±20 m to ≈10 m, with yaw error bounded and no
-waypoint-switch spins. The residual is bounded drift, not zero drift — which
-is what the actuator set can honestly deliver.
+### Validation — the proposal, measured
+
+I implemented both guidance laws and flew them against each other twice, on
+the same missions in the same wind (`analysis/`):
+
+**1. Minimal planar model** (`analysis/guidance_demo.py`, self-contained ~200
+lines): slow yaw (6°/s, as the log's turnaround shows), gusty crosswind at
+~40–60% of airspeed, same inner loops for both. Long-leg rectangle mission:
+
+```
+baseline (bearing-chasing)   cross-track rms= 29.8 m  worst= 57.4 m
+proposed (course + crab)     cross-track rms=  5.3 m  worst= 18.0 m   (-16% mission time)
+```
+
+**2. Full airship simulator** (my own; twin thrust-vectoring pods fore/aft,
+no aerodynamic surfaces — same actuator concept as this vehicle; hull
+weathervane aerodynamics, actuator lags and rate limits, sinusoidal gusts +
+Ornstein–Uhlenbeck turbulence, noisy sensors incl. 0.5 m GPS). The GNC stack
+under test uses the Exercise 1 allocation with the **Fy = 0 constraint
+enforced by construction** (pod lateral components commanded antisymmetric —
+yaw is a pure couple, heading is the only lateral authority). Only the yaw
+setpoint policy differs between runs (`analysis/sim-ex2-guidance.mjs.txt`,
+figure `analysis/sim_validation.png`):
+
+```
+                       cross-track RMS      worst       mission
+baseline (4 wind seeds)   23.4 - 27.0 m   51.6 - 64.3 m   ~360 s
+proposed (4 wind seeds)    6.8 -  8.3 m   15.6 - 30.0 m   410 - 550 s
+```
+
+A ~3× reduction in RMS cross-track and 2–3× in worst-case, consistent across
+wind realizations. Two honest costs, both expected: (1) mission time grows
+14–50% — holding the line against a crosswind at 40–60% of airspeed means
+flying at a large crab angle, which spends airspeed; the baseline is "faster"
+precisely because it surrenders to the drift; (2) the residual is bounded
+breathing (±10–15 m at gust peaks), not zero — with `Fy = 0`, gust rejection
+is rate-limited by how fast a 12 m hull can re-point. One tuning lesson worth
+reporting: the crab integrator must be **slow** relative to the heading loop
+(here 0.12 rad/s per rad of course error); at 0.35 the two loops
+limit-cycled with a ~100 s period — the same "rotate slowly and firmly"
+lesson the yaw cascade itself follows.
 
 ---
 
-## Appendix — log analysis method
+## Appendix — analysis artifacts
 
-The Annex B HTML embeds Plotly traces as base64 binary buffers.
-`analysis/extract_log.py` decodes them (9 traces, 50–100 ms sampling),
-computes per-mode tracking statistics and produces `analysis/flight_overview.png`
-and `analysis/flight_zoom.png` referenced above.
+- **Log extraction**: the Annex B HTML embeds Plotly traces as base64 binary
+  buffers. `analysis/extract_log.py` decodes them (9 traces, 50–100 ms
+  sampling), computes every statistic quoted in Exercise 2 and produces
+  `analysis/flight_overview.png` and `analysis/flight_zoom.png`.
+- **Guidance demonstration**: `analysis/guidance_demo.py` (standalone planar
+  model, produces `guidance_demo.png`); `analysis/sim-ex2-guidance.mjs.txt`
+  (the same comparison on my full airship simulator — runs inside that repo),
+  results in `analysis/ex2-results.json`, plotted by
+  `analysis/plot_sim_validation.py` → `analysis/sim_validation.png`.
