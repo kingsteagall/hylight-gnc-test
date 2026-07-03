@@ -57,10 +57,13 @@ Mz = +Lf·fy_f − Lr·fy_r                 (yaw: lateral differential)
 Both pods are on the centerline, so `Mx ≡ 0` identically — consistent with roll
 being uncontrolled. Six unknowns (a 3D force per pod) minus five equations
 leave **one free degree of freedom: the axial split**. I split `Fx` equally
-between the pods; it is symmetric, keeps both pods equally far from saturation
-in cruise, and for `Lf ≈ Lr` is also the minimum-peak-thrust choice.
-(The remaining optimization — using the split to dodge saturation corner cases —
-is a refinement, not a structural change.)
+between the pods: symmetric, predictable, and exactly minimum-peak-thrust
+whenever the two pods carry equal transverse loads (`My = 0`, e.g. cruise).
+When a pitch moment loads one pod more than the other, the optimal split
+shifts axial force toward the less-loaded pod — still closed-form
+(`u = (q_f² − q_r²) / 4Fx` equalizes the two pod norms) — but it only matters
+near saturation, so I keep it as a documented refinement rather than
+complicate the baseline.
 
 The closed-form solution, with `L = Lf + Lr`:
 
@@ -85,7 +88,9 @@ T = ‖f‖
 ```
 
 There is no iteration and no ambiguity: over `α ∈ (−180°, 180°]`,
-`β ∈ [−90°, 90°]` the map covers every thrust direction exactly once.
+`β ∈ [−90°, 90°]` the map covers every thrust direction exactly once — except
+at the poles `β = ±90°` (pure lateral thrust), where α is degenerate; that
+singularity is handled explicitly in the continuity layer below.
 
 #### Constraint 1 — normalized, unit-free demands
 
@@ -98,32 +103,46 @@ fraction of `Tmax` (so `T ∈ [0, 1]`):
   `Tmax` in opposite directions; scale `(Lf+Lr)·Tmax`).
 
 A unit command on any single axis is therefore exactly the maximum the
-airframe can do on that axis. Combined demands can exceed the actuator
-envelope, which leads to:
+airframe can do on that axis. Note the feasible set of *combined* demands is
+not the unit box — the true envelope is the coupled constraint `‖f‖ ≤ Tmax`
+per pod, so e.g. `Fz = −1` consumes the entire budget and leaves nothing for
+`My`. That coupling is unavoidable with two thrusters; the allocator makes it
+explicit rather than hiding it:
 
 **Saturation policy.** If either pod needs `‖f‖ > Tmax`, both pod forces are
 scaled down by the same factor. This preserves the *direction* of the
 commanded wrench — force and moments shrink together, and no spurious moment
-is created by clipping one component. (A prioritized alternative — e.g.
-guarantee `Fz` for altitude safety, then yaw, then axial — drops straight into
-the same spot in the code; direction-preserving scaling is the predictable
-default and is what the property tests pin down.)
+is created by clipping one component. The achieved fraction is exposed to the
+caller (`lastScale()`) so upstream integrators can anti-windup against what
+was actually allocated instead of what was requested. (A prioritized
+alternative — e.g. guarantee `Fz` for altitude safety, then yaw, then axial —
+drops straight into the same spot in the code as a staged allocation;
+direction-preserving scaling is the predictable default and is what the
+property tests pin down.)
 
 #### Constraint 2 — no abrupt servo motion
 
 The inversion above is memoryless; all continuity handling is a stateful
 post-processing layer per pod, in this order:
 
-1. **Zero-thrust freeze.** As `T → 0` the direction is undefined and `atan2`
-   would chatter on noise. Below a threshold the servos hold their last
-   position and only the motor goes to zero.
+1. **Direction-trust deadband with hysteresis.** Below ~0.1% of `Tmax` the
+   force is physically negligible, but `atan2`/`asin` would chase its
+   (noise-defined) direction at full slew rate — pure servo wear. The angles
+   freeze below the deadband and only resume tracking above twice the
+   deadband, so a demand dithering around the threshold cannot chatter. (A
+   separate `eps ≈ 1e-9` remains as the pure divide-by-zero guard.)
 2. **Singularity hold.** At `β = ±90°` (pure lateral thrust) α is undefined
    (gimbal-lock-like); α holds its previous value there.
-3. **Shortest-path unwrap of α.** The raw `atan2` jumps at ±180°. The
-   commanded α is chosen on the turn count closest to the previous command
-   (`α = α_prev + wrap(α_raw − α_prev)`), so a force direction that crosses
-   the boundary produces a continuous servo command. If the hardware has hard
-   stops instead of continuous rotation, a range clamp goes here.
+3. **Shortest-path unwrap of α within the servo range.** The raw `atan2`
+   jumps at ±180°. The commanded α is chosen among the `2π`-equivalent
+   representations as the one closest to the previous command that the servo
+   can reach. The default assumes a continuous-rotation joint (the stored
+   angle is re-based by whole turns to stay within `(−2π, 2π]` — the same
+   physical pose, so precision cannot degrade on long missions); hardware
+   with mechanical stops sets `alphaMin/alphaMax` and the allocator plans
+   within them, clamping unreachable targets to the nearest bound (the
+   residual wrench error is then visible through the forward model — see the
+   hard-stops case in the demo).
 4. **Slew-rate limiting** of α, β (default 120°/s) and of T — the commanded
    trajectory never asks more of a servo than it can physically do, whatever
    the controller upstream outputs.
@@ -132,12 +151,24 @@ post-processing layer per pod, in this order:
    pushes in unwanted directions; thrust is faded with the alignment cosine
    and restored as the servo arrives. A thrust reversal thus becomes: thrust
    fades → servo sweeps 180° at its rate limit → thrust returns (demo shows
-   the full sequence, ~1.5 s).
+   the full sequence, ~1.5 s). Easing is per-pod, so an asymmetric maneuver
+   (one pod swinging far, the other not) still produces a transient
+   uncommanded wrench — bounded (each pod's force never opposes its command
+   by more than 90°, and the episode lasts sweep-angle/slew-rate ≈ 1–1.5 s)
+   and slow compared to airship rigid-body modes (10–30 s). The property
+   tests measure it: easing cuts the parasitic transient force to less than
+   60% of the un-eased case. A coordinated variant (scale both pods by the
+   worse alignment) is a config-level extension if tighter transients are
+   needed.
 
 Items 4–5 encode a practical lesson: any discontinuity fed to a vectoring
 actuator under load turns into a transient disturbance for the vehicle;
 sweeping slowly with reduced thrust is the stable way to cross a
 configuration change.
+
+One more robustness rule, cheap and non-negotiable in flight software: a
+non-finite demand (`NaN`/`Inf` from an upstream fault) is rejected and the
+last command held — it must never latch into the servo state.
 
 ### Task 2 — C++ implementation
 
@@ -147,17 +178,26 @@ Files (plain C++17, no dependencies, header-only class):
   `allocate(Wrench) → ActuatorCommand` maps `(Fx, Fz, My, Mz)` to
   `(T_f, T_r, α_f, α_r, β_f, β_r)`; the instance carries the continuity state.
   A static `forward()` model reconstructs the produced wrench from a command —
-  used to verify the allocation.
+  used to verify the allocation. Accessors: `state()` (current pose, for
+  telemetry) and `lastScale()` (achieved demand fraction, for anti-windup).
+  The constructor sanitizes the config (geometry/timing must be positive) and
+  `allocate()` rejects non-finite demands by holding the last command.
 - `src/demo.cpp` — the demonstration script requested by the task: steady-state
-  demands (climb, cruise, reverse, pure pitch, pure yaw, combined, saturating),
-  then the two continuity showcases (cruise reversal with thrust easing,
-  zero-thrust freeze). Every case prints the command *and* the wrench
-  reconstructed by the forward model.
-- `src/tests.cpp` — property tests: exact reconstruction of 500 random feasible
-  demands; colinearity + `T ≤ Tmax` under 500 random saturating demands;
+  demands (climb, cruise, reverse, pure pitch, pure yaw, combined, saturating
+  with the achieved-percentage report), config variants (asymmetric arms,
+  servo hard stops), NaN robustness, and the two continuity showcases (cruise
+  reversal with thrust easing, zero-thrust freeze). Every case prints the
+  command *and* the wrench reconstructed by the forward model.
+- `src/tests.cpp` — property tests: exact reconstruction of 1 000 random
+  feasible demands (symmetric and asymmetric geometry); colinearity +
+  `T ≤ Tmax` + `lastScale()` correctness under 500 random saturating demands;
   slew-limit compliance over 20 000 ticks of random walks with adversarial
-  demand jumps; α continuity across three full turns of the force direction;
-  zero-thrust freeze.
+  demand jumps; α pose-continuity and boundedness across three full turns; an
+  independent hand-computed `(T, α, β)` check that breaks the
+  `allocate()/forward()` self-consistency loop; NaN/Inf rejection and
+  recovery; noise-level demands moving the servos by exactly zero; hard-stop
+  compliance; and a measurement that thrust easing cuts the parasitic
+  transient force during a reversal.
 
 Build and run:
 
@@ -187,8 +227,11 @@ Design notes an interviewer may ask about:
   commands; something has to remember the previous servo pose. Keeping it in
   the allocator keeps the flight controller stateless with respect to
   actuator geometry.
-- **Real-time suitability:** no heap allocation, no STL containers, no
-  exceptions on the hot path; `float`-ready; O(1) per call.
+- **Real-time suitability:** no heap allocation, no STL containers, `noexcept`
+  API, O(1) per call (a dozen scalar libm calls). Double precision throughout;
+  porting to `float` is mechanical (all math is scalar) but requires retuning
+  tolerances — the turn re-basing already keeps angles small enough for float
+  resolution.
 
 ---
 
@@ -208,11 +251,13 @@ position 263–351 s → altitude; extraction script and plots in `analysis/`).*
    ship **backwards to −2.4 m/s** while station-keeping. A crosswind component
    translates directly into sideslip: course over ground ≠ heading.
 3. **Slender-body directional instability (Munk moment)**: the bare hull is
-   statically unstable in yaw; in cruise the yaw error oscillates ±22° with a
-   ~26 s period — classic heading hunting under gusts with a PID that has no
-   disturbance model. Every degree of heading error at 2.5 m/s is ≈4.4 cm/s of
-   lateral velocity; ±22° ≈ ±0.9 m/s of cross-track drift rate.
-4. **Large inertia, low yaw authority**: the waypoint turnaround at t≈85–125 s
+   statically unstable in yaw; in cruise the yaw error hunts with a ~30 s
+   period, RMS ≈10° and excursions to ~41° (130–260 s window, setpoint
+   wrap-flips masked) — classic heading hunting under gusts with a PID that
+   has no disturbance model. Every degree of heading error at cruise speed is
+   ≈4 cm/s of lateral velocity, so the hunting alone injects 0.4 m/s RMS and
+   up to ~1.4 m/s of cross-track drift rate.
+4. **Large inertia, low yaw authority**: the waypoint turnaround at t≈85–130 s
    takes ~45 s for a net 261° rotation (~5.8°/s average). Long yaw transients
    mean long stretches flown with the nose off-course.
 
@@ -231,13 +276,15 @@ position 263–351 s → altitude; extraction script and plots in `analysis/`).*
    near south. Fed to a PID without shortest-arc error handling, each flip
    commands a full-circle turn; the log indeed shows the vehicle winding
    through ±180° repeatedly during that window.
-8. **Observability gap — the log itself.** Annex B contains vx, altitude,
-   pitch, yaw and their setpoints, but **no lateral position, no vy, no course
-   over ground, no cross-track error, no actuator commands, no wind
-   estimate**. The drift cannot even be *seen* in this log, only inferred.
-   Altitude and pitch meanwhile track within ±0.7 m / ±1° — the problem is
-   confined to the horizontal plane, and the quantity that defines it is not
-   measured, not logged, and not controlled.
+8. **And the loop cannot even observe the error it needs to close.** Annex B
+   contains vx, altitude, pitch, yaw and their setpoints, but **no lateral
+   position, no vy, no course over ground, no cross-track error, no actuator
+   commands, no wind estimate**. The drift cannot even be *seen* in this log,
+   only inferred — which is the answer to whether the logs "contain enough
+   information": not quite, and that gap is itself part of the problem.
+   Altitude and pitch meanwhile track with RMS ≈0.75 m / ≈0.9° (peaks 1.6 m /
+   4.2°) — the problem is confined to the horizontal plane, and the quantity
+   that defines it is not measured, not logged, and not controlled.
 
 ### Q2 — Proposal: control the track, not the nose
 
@@ -274,10 +321,13 @@ bounded authority, no perfect wind knowledge):
    actuator commands — both to close the loop and to make the next flight
    debuggable.
 
-Expected result (from having implemented exactly this scheme on a 6-DoF
-airship simulator with the same actuator topology): cross-track drift drops
-from tens of meters to under ~10 m in gusty crosswind, with yaw error bounded
-and no waypoint-switch spins.
+Expected result — from having implemented this scheme in my own 6-DoF airship
+flight simulator (twin thrust-vectoring pods fore/aft, no aerodynamic
+surfaces, comparable to this vehicle): switching from bearing-chasing to
+course-based guidance with an integral crab term took cross-track drift in
+gusty crosswind from ±20 m to ≈10 m, with yaw error bounded and no
+waypoint-switch spins. The residual is bounded drift, not zero drift — which
+is what the actuator set can honestly deliver.
 
 ---
 

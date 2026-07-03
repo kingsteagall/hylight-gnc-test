@@ -48,17 +48,43 @@ def main(path):
 
     x, y = tr["Yaw"]
     xs, ys = tr["Yaw setpoint"]
-    err = angerr(y, np.interp(x, xs, ys))
+    # Hold-interpolate the setpoint (linear interp across a +-180 wrap flip
+    # manufactures spurious ~180 deg errors) and mask the 243-250 s flip burst.
+    idx = np.clip(np.searchsorted(xs, x, side="right") - 1, 0, len(ys) - 1)
+    err = angerr(y, ys[idx])
 
-    sl = (x >= 130) & (x <= 260)
-    print(f"cruise 130-260s: yaw_err rms={np.sqrt(np.mean(err[sl]**2)):.1f} deg")
+    sl = (x >= 130) & (x <= 260) & ~((x >= 242) & (x <= 250))
+    e = err[sl]
+    print(f"cruise 130-260s (flips masked): yaw_err rms={np.sqrt(np.mean(e**2)):.1f} "
+          f"max={np.abs(e).max():.1f} deg")
+    ed = e - e.mean()
+    f = np.fft.rfftfreq(len(ed), np.median(np.diff(x[sl])))
+    P = np.abs(np.fft.rfft(ed * np.hanning(len(ed)))) ** 2
+    print(f"dominant yaw-hunt period ~{1 / f[np.argmax(P[1:]) + 1]:.0f} s")
+
+    s5 = (x >= 85) & (x <= 130)
+    unw = np.degrees(np.unwrap(np.radians(y[s5])))
+    print(f"turnaround 85-130s: net {unw[-1] - unw[0]:+.0f} deg in {x[s5][-1] - x[s5][0]:.0f} s")
 
     x2, y2 = tr["Vx"]
     xs2, ys2 = tr["Vx setpoint"]
     sp2 = np.interp(x2, xs2, ys2)
     c = (x2 >= 130) & (x2 <= 260) & (sp2 > 1)
     print(f"cruise vx: sp={sp2[c].mean():.2f} act={y2[c].mean():.2f} m/s")
+    pos = (x2 >= 263.5) & (x2 <= 351.5)
+    print(f"position mode: min vx={y2[pos].min():.2f} m/s (pushed backwards)")
     print(f"yaw-sp wrap flips (>300 deg jumps): {np.sum(np.abs(np.diff(ys)) > 300)}")
+
+    x3, y3 = tr["Altitude"]
+    xs3, ys3 = tr["Altitude setpoint"]
+    ae = y3 - np.interp(x3, xs3, ys3)
+    sm = (x3 >= 40) & (x3 <= 260)
+    xp, yp = tr["Pitch"]
+    xps, yps = tr["Pitch setpoint"]
+    pe = yp - np.interp(xp, xps, yps)
+    sp_ = (xp >= 40) & (xp <= 260)
+    print(f"alt err rms={np.sqrt(np.mean(ae[sm]**2)):.2f} max={np.abs(ae[sm]).max():.2f} m; "
+          f"pitch err rms={np.sqrt(np.mean(pe[sp_]**2)):.2f} max={np.abs(pe[sp_]).max():.2f} deg")
 
     # Overview plot
     fig, axs = plt.subplots(4, 1, figsize=(16, 14), sharex=True)

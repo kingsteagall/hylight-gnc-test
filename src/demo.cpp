@@ -7,7 +7,6 @@
 // Build:  g++ -std=c++17 -O2 demo.cpp -o demo   (or em++/clang++, header-only)
 
 #include <cstdio>
-#include <cmath>
 
 #include "ControlAllocator.hpp"
 
@@ -66,7 +65,33 @@ int main() {
   for (const Case& k : cases) {
     alloc.reset();
     printCase(k.name, k.w, converge(alloc, k.w), cfg);
+    if (alloc.lastScale() < 1.0)
+      std::printf("  (demand infeasible: allocated %.0f%%, direction preserved)\n\n",
+                  100.0 * alloc.lastScale());
   }
+
+  std::printf("== Config: asymmetric arms (Lf=4, Lr=8) ==\n\n");
+  AllocatorConfig acf;
+  acf.Lf = 4.0;
+  acf.Lr = 8.0;
+  ControlAllocator asym(acf);
+  printCase("cruise+climb+pitch+yaw", {0.4, -0.5, 0.2, 0.1},
+            converge(asym, {0.4, -0.5, 0.2, 0.1}), acf);
+
+  std::printf("== Config: servo hard stops (alpha within +-120 deg) ==\n\n");
+  AllocatorConfig scf;
+  scf.alphaMin = -120.0 * gnc::kPi / 180.0;
+  scf.alphaMax = 120.0 * gnc::kPi / 180.0;
+  ControlAllocator stops(scf);
+  printCase("pitch nose-up (My=+0.4)", {0, 0, 0.4, 0},
+            converge(stops, {0, 0, 0.4, 0}), scf);
+
+  std::printf("== Robustness: non-finite demand is held, then recovers ==\n\n");
+  alloc.reset();
+  converge(alloc, {0.5, 0, 0, 0});
+  ActuatorCommand held = alloc.allocate({0.0 / 0.0, 0, 0, 0});
+  std::printf("  NaN demand -> last command held (T=%.3f a=%+.1f deg), state clean\n\n",
+              held.front.T, deg(held.front.alpha));
 
   std::printf("== Continuity: cruise reversal Fx +0.8 -> -0.8 ==\n\n");
   alloc.reset();
