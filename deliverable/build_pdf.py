@@ -342,8 +342,9 @@ story += [
     P("Both guidance laws flew the same missions in the same wind, twice: a "
       "minimal planar model, and my own full airship simulator (twin "
       "vectoring pods fore/aft, hull weathervane aerodynamics, actuator "
-      "lags, gusts + turbulence, noisy sensors; the Exercise 1 allocation "
-      "with Fy = 0 respected by construction — yaw is a pure couple). "
+      "lags, gusts + turbulence, noisy sensors; the same two-pod allocation "
+      "strategy as Exercise 1 — Fy = 0 by construction, yaw a pure couple — "
+      "reimplemented in the simulator, not the submitted C++ class). "
       "Metrics are whole-leg, no transient exclusions:"),
     table([
         ["", "cross-track RMS", "worst", "mission time"],

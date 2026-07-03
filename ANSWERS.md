@@ -1,9 +1,18 @@
 # GNC Technical Test — Answers
 
-David Steagall — July 2026
+David Roberts Steagall — 03/07/2026
 
 - Exercise 1: allocation strategy (Task 1) and C++ implementation (Task 2, `src/`).
 - Exercise 2: drift analysis and guidance proposal, supported by the Annex B log (`analysis/`).
+
+**Scope note.** The direct answer to the 2.5 h task is the allocation strategy
+(Task 1) and the C++ class + demo (Task 2, `src/`). Everything beyond that —
+the property tests, the self-checking `forward()` model, NaN/Inf handling, the
+anti-windup saturation report (`lastScale()`), the config variants (asymmetric
+arms, servo hard stops), thrust easing, and the simulator validation in
+Exercise 2 — is deliberate optional hardening and exploration: partly because
+the statement says the code will be questioned, partly because the problem is
+interesting.
 
 ---
 
@@ -345,10 +354,12 @@ proposed (course + crab)     cross-track rms=  7.5 m  worst= 28.4 m   (-16% miss
 no aerodynamic surfaces — same actuator concept as this vehicle; hull
 weathervane aerodynamics, actuator lags and rate limits, sinusoidal gusts +
 Ornstein–Uhlenbeck turbulence, noisy sensors incl. 0.5 m GPS). The GNC stack
-under test uses the Exercise 1 allocation with the **Fy = 0 constraint
-respected by construction**: the allocator has no net-side-force channel —
-pod lateral components are commanded antisymmetric, so yaw is a pure couple
-and heading is the only lateral authority. (Commanded net side force is
+under test applies the **same two-pod allocation strategy as Exercise 1 —
+Fy = 0 by construction, pod lateral components commanded antisymmetric, so
+yaw is a pure couple** — reimplemented inside the simulator (its own
+elevation/azimuth angle parametrization and staged saturation policy; the
+submitted C++ class, with its α/β angles and continuity layer, is not what
+flies here — same principle, separate implementation). (Commanded net side force is
 identically zero; the *delivered* Fy deviates only transiently through
 per-pod saturation clamps and actuator lag — measured at 0.05 N RMS, 0.75 N
 peak ≈ 1% of one motor's thrust.) Only the guidance layer — the yaw-setpoint
