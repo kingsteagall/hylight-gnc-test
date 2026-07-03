@@ -125,16 +125,23 @@ def table(data, widths, header=True, fontsize=8.8, align="CENTER"):
 story = []
 
 # ================================================================= cover head
+REPO = "https://github.com/kingsteagall/hylight-gnc-test"
 story += [
     P("GNC Technical Test — Answers", "title"),
-    P("David Steagall  ·  July 2026", "sub"),
+    P("<b>David Roberts Steagall</b>  ·  "
+      "<a href='mailto:david.steagall@gmail.com' color='#2563eb'>"
+      "david.steagall@gmail.com</a>  ·  +55 21 98440-9428", "sub",
+      spaceAfter=1),
+    P(f"03/07/2026  ·  solution repository: "
+      f"<a href='{REPO}' color='#2563eb'><u>{REPO.replace('https://','')}"
+      f"</u></a>", "sub"),
     callout(
         "<b>Exercise 1</b> — closed-form control allocation, delivered as a "
         "C++17 class with a demo script and 10 property tests (all green)."
         "<br/><b>Exercise 2</b> — drift diagnosis from the Annex B log, and a "
         "course-based guidance fix, <b>measured</b>: ~3× less cross-track "
-        "error on two independent simulations. Full sources ship alongside "
-        "this document."),
+        "error on two independent simulations. Full sources in the repository "
+        "above."),
     Spacer(1, 10),
 ]
 
@@ -407,9 +414,10 @@ story += [
         "The comparison pays for its own corner transients.",
         bg=colors.HexColor("#fff7ed"), border=ORANGE),
     Spacer(1, 10),
-    P("<i>Everything in this document regenerates from the attached sources: "
-      "src/ (Exercise 1), analysis/ (Exercise 2 + log), deliverable/ (this "
-      "PDF). Property tests: ./tests → ALL TESTS PASSED.</i>", fontSize=8.8),
+    P("<i>Everything in this document regenerates from the solution "
+      "repository (github.com/kingsteagall/hylight-gnc-test): src/ "
+      "(Exercise 1), analysis/ (Exercise 2 + log), deliverable/ (this PDF). "
+      "Property tests: ./tests → ALL TESTS PASSED.</i>", fontSize=8.8),
 ]
 
 doc = SimpleDocTemplate(str(HERE / "GNC-Technical-Test-Answers.pdf"),
@@ -417,6 +425,6 @@ doc = SimpleDocTemplate(str(HERE / "GNC-Technical-Test-Answers.pdf"),
                         leftMargin=2.0 * cm, rightMargin=2.0 * cm,
                         topMargin=1.7 * cm, bottomMargin=1.6 * cm,
                         title="GNC Technical Test — Answers",
-                        author="David Steagall")
+                        author="David Roberts Steagall")
 doc.build(story)
 print("built GNC-Technical-Test-Answers.pdf")
